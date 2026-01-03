@@ -1,0 +1,22 @@
+name: "Saykai Gate - Demo Surface"
+description: "Public evaluation surface for the Saykai CI safety gate."
+author: "Saykai Systems"
+inputs:
+  spec_path:
+    description: "Path to Safety Spec YAML"
+    required: false
+    default: ".saykai/spec.yml"
+  required_label:
+    description: "Label required for protected path changes"
+    required: false
+    default: "saykai-approved"
+  max_files_scanned:
+    description: "Max number of changed files to evaluate"
+    required: false
+    default: "200"
+runs:
+  using: "node20"
+  main: "dist/index.js"
+branding:
+  icon: "shield"
+  color: "blue"

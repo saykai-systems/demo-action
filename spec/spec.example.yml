@@ -1,0 +1,18 @@
+version: "1.0"
+
+rules:
+  forbidden_patterns:
+    - id: "no-disable-auth"
+      pattern: "disable_auth"
+      message: "Auth bypass flags are not allowed."
+
+    - id: "no-rm-rf"
+      pattern: "rm -rf"
+      message: "Destructive commands are blocked."
+
+  protected_paths:
+    - id: "prod-config-guard"
+      paths:
+        - "infra/prod/"
+        - ".github/workflows/"
+      message: "Protected paths changed. Requires explicit approval label."
