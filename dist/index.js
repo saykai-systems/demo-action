@@ -3,26 +3,39 @@
 /*
   Saykai Gate - Demo Surface (Public)
 
-  Goals:
+  Goals
   - Demonstrate spec-driven CI gating with crisp UX
   - Do not reveal any proprietary core engine logic
-  - Look "real": file+line annotations, job summary, reports
+  - Look real: file+line annotations, job summary, reports
 
-  Behavior:
+  Behavior
   - Runs on pull_request (skips otherwise)
   - Loads .saykai/spec.yml (or input spec_path)
   - Validates minimal spec structure
   - Checks:
       1) forbidden_patterns: scans ONLY added lines in PR diffs
       2) protected_paths: blocks changes to protected paths unless PR has required label
-  - Writes:
+  - Writes (to the repo workspace):
       .saykai/report.json
       .saykai/report.md
+
+  Important
+  - Node actions run from the action install directory by default, not the repo.
+    This file forces all IO and git commands to run inside GITHUB_WORKSPACE so
+    upload-artifact can find .saykai/.
 */
 
 const fs = require("fs");
 const path = require("path");
 const cp = require("child_process");
+
+// Always operate in the checked-out repository workspace.
+const WORKDIR = process.env.GITHUB_WORKSPACE || process.cwd();
+try {
+  process.chdir(WORKDIR);
+} catch {
+  // If chdir fails, we'll still attempt to run, but artifacts may not upload.
+}
 
 function out(msg) {
   process.stdout.write(`${msg}\n`);
@@ -43,11 +56,6 @@ function errorAt(file, line, msg) {
   process.stdout.write(`::error file=${safeFile}${safeLine},title=Saykai Demo Gate::${safeMsg}\n`);
 }
 
-function fail(msg) {
-  error(msg);
-  process.exit(1);
-}
-
 function getInput(name, fallback) {
   const key = `INPUT_${name.replace(/ /g, "_").toUpperCase()}`;
   return (process.env[key] || fallback || "").trim();
@@ -59,7 +67,8 @@ function toInt(v, fallback) {
 }
 
 function sh(cmd) {
-  return cp.execSync(cmd, { stdio: ["ignore", "pipe", "pipe"] }).toString("utf8");
+  // Run commands in the repo workspace, not the action directory.
+  return cp.execSync(cmd, { cwd: WORKDIR, stdio: ["ignore", "pipe", "pipe"] }).toString("utf8");
 }
 
 function safeReadJSON(p) {
@@ -93,7 +102,7 @@ function appendSummary(md) {
   - arrays of objects using "- key: value" followed by indented keys
   - arrays of strings using "- value"
 
-  This is intentionally not a full YAML implementation.
+  Intentionally not a full YAML implementation.
 */
 function parseDemoYaml(yamlText) {
   const lines = yamlText
@@ -308,28 +317,66 @@ function scanAddedLinesForPatterns(base, head, patterns) {
   return hits;
 }
 
+function writeReportFiles(reportDirAbs, report) {
+  ensureDir(reportDirAbs);
+
+  const jsonPathAbs = path.join(reportDirAbs, "report.json");
+  writeFile(jsonPathAbs, JSON.stringify(report, null, 2));
+
+  const mdLines = [];
+  mdLines.push("# Saykai Demo Gate report");
+  mdLines.push("");
+  mdLines.push(`- Spec version: ${report.spec_version || "unknown"}`);
+  if (report.pr && report.pr.number != null) mdLines.push(`- PR: #${report.pr.number} - ${report.pr.title || ""}`.trim());
+  mdLines.push(`- Labels: ${(report.pr && report.pr.labels && report.pr.labels.length) ? report.pr.labels.join(", ") : "none"}`);
+  mdLines.push("");
+
+  if (report.results && report.results.passed) {
+    mdLines.push("## Result");
+    mdLines.push("PASS");
+  } else {
+    mdLines.push("## Result");
+    mdLines.push("BLOCK");
+    mdLines.push("");
+
+    if (report.results && Array.isArray(report.results.failures) && report.results.failures.length) {
+      mdLines.push("## Failures");
+      for (const f of report.results.failures) {
+        if (f.type === "forbidden_pattern") {
+          mdLines.push(`- Forbidden pattern \`${f.pattern}\` in \`${f.file}:${f.line}\` (rule: \`${f.rule_id}\`)`);
+        } else if (f.type === "protected_paths") {
+          mdLines.push(`- Protected paths changed without label \`${f.required_label}\` (rule: \`${f.rule_id}\`)`);
+          mdLines.push(
+            `  - Files: ${f.touched_files.slice(0, 20).join(", ")}${f.touched_files.length > 20 ? " ..." : ""}`
+          );
+        } else if (f.type === "fatal") {
+          mdLines.push(`- ${f.message}`);
+        }
+      }
+    }
+  }
+
+  const mdPathAbs = path.join(reportDirAbs, "report.md");
+  writeFile(mdPathAbs, mdLines.join("\n") + "\n");
+
+  // Return repo-relative paths (for job summary readability)
+  const jsonPathRel = path.relative(WORKDIR, jsonPathAbs).replace(/\\/g, "/");
+  const mdPathRel = path.relative(WORKDIR, mdPathAbs).replace(/\\/g, "/");
+  return { jsonPathRel, mdPathRel };
+}
+
 (function main() {
-  const specPath = getInput("spec_path", ".saykai/spec.yml");
+  const specPathInput = getInput("spec_path", ".saykai/spec.yml");
   const requiredLabel = getInput("required_label", "saykai-approved");
   const maxFilesScanned = toInt(getInput("max_files_scanned", "200"), 200);
 
+  const specPathAbs = path.isAbsolute(specPathInput) ? specPathInput : path.join(WORKDIR, specPathInput);
+  const reportDirAbs = path.join(WORKDIR, ".saykai");
+
   appendSummary("# Saykai Gate - Demo Surface\n");
-  appendSummary(`- Spec: \`${specPath}\``);
+  appendSummary(`- Workspace: \`${WORKDIR}\``);
+  appendSummary(`- Spec: \`${specPathInput}\``);
   appendSummary(`- Required label for protected paths: \`${requiredLabel}\``);
-
-  if (!fs.existsSync(specPath)) {
-    fail(`Missing Safety Spec at ${specPath}. Add one or set inputs.spec_path.`);
-  }
-
-  const specText = fs.readFileSync(specPath, "utf8");
-  const spec = parseDemoYaml(specText);
-  const specErrors = validateSpec(spec);
-
-  if (specErrors.length) {
-    appendSummary("\n## Spec validation\n");
-    for (const e of specErrors) appendSummary(`- ${e}`);
-    fail("Invalid Safety Spec. Fix spec format.");
-  }
 
   const payload = getPRPayload();
   if (!payload) {
@@ -338,38 +385,86 @@ function scanAddedLinesForPatterns(base, head, patterns) {
     process.exit(0);
   }
 
-  const range = computeRange(payload);
-  if (!range) fail("Unable to compute diff range for PR.");
-
-  const labels = getPRLabels(payload);
-  const changedFilesAll = listChangedFiles(range.base, range.head);
-  const changedFilesEvaluated = changedFilesAll.slice(0, maxFilesScanned);
-
-  appendSummary("\n## Change set\n");
-  appendSummary(`- Files changed: **${changedFilesAll.length}** (evaluating up to **${changedFilesEvaluated.length}**)`);
-  appendSummary(`- PR labels: ${labels.length ? labels.map((l) => `\`${l}\``).join(", ") : "_none_"}`);
-
-  const reportDir = ".saykai";
-  ensureDir(reportDir);
-
+  // Build a report object early so we can always write artifacts on failures.
   const report = {
     gate: "saykai-demo",
-    spec_version: spec.version,
+    spec_version: "unknown",
     pr: {
       number: payload.pull_request.number,
       title: payload.pull_request.title,
-      labels
+      labels: []
     },
     diff: {
-      base: range.base,
-      head: range.head,
-      changed_files: changedFilesAll
+      base: null,
+      head: null,
+      changed_files: []
     },
     results: {
       passed: true,
       failures: []
     }
   };
+
+  const labels = getPRLabels(payload);
+  report.pr.labels = labels;
+
+  const range = computeRange(payload);
+  if (!range) {
+    report.results.passed = false;
+    report.results.failures.push({ type: "fatal", message: "Unable to compute diff range for PR." });
+    const paths = writeReportFiles(reportDirAbs, report);
+    appendSummary("\n## Gate result\n- Status: **BLOCK**");
+    appendSummary(`- Report: \`${paths.jsonPathRel}\` and \`${paths.mdPathRel}\``);
+    error("Unable to compute diff range for PR.");
+    process.exit(1);
+  }
+
+  report.diff.base = range.base;
+  report.diff.head = range.head;
+
+  if (!fs.existsSync(specPathAbs)) {
+    report.results.passed = false;
+    report.results.failures.push({
+      type: "fatal",
+      message: `Missing Safety Spec at ${specPathInput}. Add one or set inputs.spec_path.`
+    });
+    const paths = writeReportFiles(reportDirAbs, report);
+    appendSummary("\n## Gate result\n- Status: **BLOCK**");
+    appendSummary(`- Report: \`${paths.jsonPathRel}\` and \`${paths.mdPathRel}\``);
+    error(`Missing Safety Spec at ${specPathInput}. Add one or set inputs.spec_path.`);
+    process.exit(1);
+  }
+
+  const specText = fs.readFileSync(specPathAbs, "utf8");
+  const spec = parseDemoYaml(specText);
+  const specErrors = validateSpec(spec);
+
+  if (specErrors.length) {
+    report.results.passed = false;
+    report.results.failures.push({ type: "fatal", message: "Invalid Safety Spec. Fix spec format." });
+    report.results.failures.push(...specErrors.map((e) => ({ type: "fatal", message: e })));
+
+    const paths = writeReportFiles(reportDirAbs, report);
+
+    appendSummary("\n## Spec validation\n");
+    for (const e of specErrors) appendSummary(`- ${e}`);
+
+    appendSummary("\n## Gate result\n- Status: **BLOCK**");
+    appendSummary(`- Report: \`${paths.jsonPathRel}\` and \`${paths.mdPathRel}\``);
+
+    error("Invalid Safety Spec. Fix spec format.");
+    process.exit(1);
+  }
+
+  report.spec_version = spec.version;
+
+  const changedFilesAll = listChangedFiles(range.base, range.head);
+  const changedFilesEvaluated = changedFilesAll.slice(0, maxFilesScanned);
+  report.diff.changed_files = changedFilesAll;
+
+  appendSummary("\n## Change set\n");
+  appendSummary(`- Files changed: **${changedFilesAll.length}** (evaluating up to **${changedFilesEvaluated.length}**)`);
+  appendSummary(`- PR labels: ${labels.length ? labels.map((l) => `\`${l}\``).join(", ") : "_none_"}`);
 
   // Check 1: Forbidden patterns (added lines only)
   const forbiddenRules = spec.rules.forbidden_patterns || [];
@@ -400,57 +495,21 @@ function scanAddedLinesForPatterns(base, head, patterns) {
     }
   }
 
-  // Write reports
-  const jsonPath = path.join(reportDir, "report.json");
-  writeFile(jsonPath, JSON.stringify(report, null, 2));
-
-  const mdLines = [];
-  mdLines.push("# Saykai Demo Gate report");
-  mdLines.push("");
-  mdLines.push(`- Spec version: ${spec.version}`);
-  mdLines.push(`- PR: #${report.pr.number} - ${report.pr.title}`);
-  mdLines.push(`- Labels: ${labels.length ? labels.join(", ") : "none"}`);
-  mdLines.push("");
-
-  if (report.results.passed) {
-    mdLines.push("## Result");
-    mdLines.push("PASS");
-  } else {
-    mdLines.push("## Result");
-    mdLines.push("BLOCK");
-    mdLines.push("");
-    mdLines.push("## Failures");
-    for (const f of report.results.failures) {
-      if (f.type === "forbidden_pattern") {
-        mdLines.push(
-          `- Forbidden pattern \`${f.pattern}\` in \`${f.file}:${f.line}\` (rule: \`${f.rule_id}\`)`
-        );
-      } else if (f.type === "protected_paths") {
-        mdLines.push(
-          `- Protected paths changed without label \`${f.required_label}\` (rule: \`${f.rule_id}\`)`
-        );
-        mdLines.push(
-          `  - Files: ${f.touched_files.slice(0, 20).join(", ")}${f.touched_files.length > 20 ? " ..." : ""}`
-        );
-      }
-    }
-  }
-
-  const mdPath = path.join(reportDir, "report.md");
-  writeFile(mdPath, mdLines.join("\n") + "\n");
+  // Always write reports to the repo workspace so upload-artifact can find them.
+  const paths = writeReportFiles(reportDirAbs, report);
 
   // Job summary
   appendSummary("\n## Gate result\n");
   if (report.results.passed) {
     appendSummary("- Status: **PASS**");
-    appendSummary(`- Report: \`${jsonPath}\` and \`${mdPath}\``);
+    appendSummary(`- Report: \`${paths.jsonPathRel}\` and \`${paths.mdPathRel}\``);
     out("Saykai Demo Gate: PASS");
     process.exit(0);
   }
 
   appendSummary("- Status: **BLOCK**");
   appendSummary(`- Failures: **${report.results.failures.length}**`);
-  appendSummary(`- Report: \`${jsonPath}\` and \`${mdPath}\``);
+  appendSummary(`- Report: \`${paths.jsonPathRel}\` and \`${paths.mdPathRel}\``);
 
   appendSummary("\n### Failures (top)\n");
   for (const f of report.results.failures.slice(0, 10)) {
@@ -458,9 +517,11 @@ function scanAddedLinesForPatterns(base, head, patterns) {
       appendSummary(`- Forbidden pattern \`${f.pattern}\` in \`${f.file}:${f.line}\` (rule: \`${f.rule_id}\`)`);
     } else if (f.type === "protected_paths") {
       appendSummary(`- Protected paths changed without label \`${f.required_label}\` (rule: \`${f.rule_id}\`)`);
+    } else if (f.type === "fatal") {
+      appendSummary(`- ${f.message}`);
     }
   }
 
-  fail("Saykai Demo Gate blocked this change. See job summary and .saykai reports.");
+  error("Saykai Demo Gate blocked this change. See job summary and .saykai reports.");
+  process.exit(1);
 })();
-EOF
